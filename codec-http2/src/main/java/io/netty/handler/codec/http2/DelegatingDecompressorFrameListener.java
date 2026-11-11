@@ -105,11 +105,14 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                 decompressor.incrementDecompressedBytes(compressedBytes);
                 return compressedBytes;
             }
+            // Buffer that was already extracted from the decompressor but not passed to the listener yet. It is
+            // tracked outside of the loop so we are able to release it in all cases.
+            ByteBuf nextBuf = null;
             try {
                 Http2LocalFlowController flowController = connection.local().flowController();
                 decompressor.incrementDecompressedBytes(padding);
                 for (;;) {
-                    ByteBuf nextBuf = nextReadableBuf(channel);
+                    nextBuf = nextReadableBuf(channel);
                     boolean decompressedEndOfStream = nextBuf == null && endOfStream;
                     if (decompressedEndOfStream && channel.finish()) {
                         nextBuf = nextReadableBuf(channel);
@@ -129,6 +132,7 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                     padding = 0; // Padding is only communicated once on the first iteration.
                     buf.release();
                     buf = nextBuf;
+                    nextBuf = null;
                 }
                 // We consume bytes each time we call the listener to ensure if multiple frames are decompressed
                 // that the bytes are accounted for immediately. Otherwise the user may see an inconsistent state of
@@ -136,6 +140,11 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                 return 0;
             } finally {
                 buf.release();
+                if (nextBuf != null) {
+                    // The listener or the flow controller did throw before we were able to pass the already
+                    // decompressed buffer to the listener. Release it as otherwise we would leak memory.
+                    nextBuf.release();
+                }
             }
         } catch (Http2Exception e) {
             throw e;
