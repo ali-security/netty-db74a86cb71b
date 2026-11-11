@@ -14,17 +14,25 @@
  */
 package io.netty.handler.codec.http2;
 
+import com.aayushatharva.brotli4j.decoder.DecoderJNI;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.compression.Brotli;
 import io.netty.handler.codec.compression.BrotliDecoder;
+import io.netty.handler.codec.compression.DecompressionException;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
 import io.netty.handler.codec.compression.ZlibWrapper;
 import io.netty.handler.codec.compression.SnappyFrameDecoder;
 import io.netty.util.internal.UnstableApi;
+
+import java.nio.ByteBuffer;
+import java.util.List;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
@@ -49,18 +57,50 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     private final Http2Connection connection;
     private final boolean strict;
+    private final int maxAllocation;
     private boolean flowControllerInitialized;
     private final Http2Connection.PropertyKey propertyKey;
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener) {
-        this(connection, listener, true);
+        this(connection, listener, true, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param connection the connection to read data which should be decompressed
+     * @param listener the delegate listener used by {@link Http2FrameListenerDecorator}
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream before the stream is
+     *                      failed. Must be &gt;= 0. If zero, the decompressed size is not limited. Bounding the
+     *                      decompressed output guards against decompression bombs.
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    int maxAllocation) {
+        this(connection, listener, true, maxAllocation);
     }
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
                     boolean strict) {
+        this(connection, listener, strict, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param connection the connection to read data which should be decompressed
+     * @param listener the delegate listener used by {@link Http2FrameListenerDecorator}
+     * @param strict if {@code true}, {@link ZlibWrapper#ZLIB} will be used for the decoder,
+     *               otherwise the decoder can fallback to {@link ZlibWrapper#NONE}
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream before the stream is
+     *                      failed. Must be &gt;= 0. If zero, the decompressed size is not limited. Bounding the
+     *                      decompressed output guards against decompression bombs.
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    boolean strict, int maxAllocation) {
         super(listener);
         this.connection = connection;
         this.strict = strict;
+        this.maxAllocation = checkPositiveOrZero(maxAllocation, "maxAllocation");
 
         propertyKey = connection.newKey();
         connection.addListener(new Http2ConnectionAdapter() {
@@ -180,25 +220,41 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
     protected EmbeddedChannel newContentDecompressor(final ChannelHandlerContext ctx, CharSequence contentEncoding)
             throws Http2Exception {
         if (GZIP.contentEqualsIgnoreCase(contentEncoding) || X_GZIP.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
         }
         if (DEFLATE.contentEqualsIgnoreCase(contentEncoding) || X_DEFLATE.contentEqualsIgnoreCase(contentEncoding)) {
             final ZlibWrapper wrapper = strict ? ZlibWrapper.ZLIB : ZlibWrapper.ZLIB_OR_NONE;
             // To be strict, 'deflate' means ZLIB, but some servers were not implemented correctly.
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(wrapper));
         }
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+            if (maxAllocation > 0) {
+                // BrotliDecoder collects everything an input buffer decompresses to before forwarding it, which
+                // a limit applied after the decoder can not bound. Use a decoder that enforces the limit itself.
+                return newDecompressorChannel(ctx, new BoundedBrotliDecoder(maxAllocation));
+            }
+            return newDecompressorChannel(ctx, new BrotliDecoder());
         }
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+            return newDecompressorChannel(ctx, new SnappyFrameDecoder());
         }
         // 'identity' or unsupported
         return null;
+    }
+
+    /**
+     * Build the per-stream {@link EmbeddedChannel} that performs decompression. When {@code maxAllocation > 0} a
+     * {@link DecompressionLimiter} is appended after the decoder so the total decompressed output is bounded,
+     * mirroring the {@code maxAllocation} enforcement performed by the standalone compression decoders but kept
+     * self-contained within this module (so it does not depend on a patched {@code netty-codec}).
+     */
+    private EmbeddedChannel newDecompressorChannel(final ChannelHandlerContext ctx, ChannelHandler decoder) {
+        if (maxAllocation > 0) {
+            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                    ctx.channel().config(), decoder, new DecompressionLimiter(maxAllocation));
+        }
+        return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                ctx.channel().config(), decoder);
     }
 
     /**
@@ -270,6 +326,165 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     Http2Decompressor decompressor(Http2Stream stream) {
         return stream == null ? null : (Http2Decompressor) stream.getProperty(propertyKey);
+    }
+
+    /**
+     * Inbound handler appended after the decoder inside the per-stream decompression {@link EmbeddedChannel}.
+     * It tracks the cumulative number of decompressed bytes and fails the stream once {@code maxAllocation} is
+     * exceeded. Every buffer past the limit is released as soon as the decoder forwards it, so no more than
+     * {@code maxAllocation} decompressed bytes are ever retained or delivered to the listener, without modifying
+     * (or depending on a patched) {@code netty-codec}.
+     */
+    private static final class DecompressionLimiter extends ChannelInboundHandlerAdapter {
+        private final int maxAllocation;
+        private long totalOutputBytes;
+
+        DecompressionLimiter(int maxAllocation) {
+            this.maxAllocation = maxAllocation;
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof ByteBuf) {
+                totalOutputBytes += ((ByteBuf) msg).readableBytes();
+                if (totalOutputBytes > maxAllocation) {
+                    ((ByteBuf) msg).release();
+                    throw new DecompressionException(
+                            "Decompression buffer has reached maximum size: " + maxAllocation);
+                }
+            }
+            ctx.fireChannelRead(msg);
+        }
+    }
+
+    /**
+     * Brotli decoder used instead of {@link BrotliDecoder} when {@code maxAllocation > 0}.
+     * <p>
+     * {@link BrotliDecoder} collects everything a single input buffer decompresses to before it forwards anything,
+     * so one small {@code DATA} frame could expand to gigabytes before {@link DecompressionLimiter} sees a byte.
+     * This decoder checks the limit before copying each chunk out of brotli's internal buffer and fails as soon as
+     * the total decompressed output of the stream would exceed {@code maxAllocation}.
+     */
+    private static final class BoundedBrotliDecoder extends ByteToMessageDecoder {
+        private static final int INPUT_BUFFER_SIZE = 8 * 1024;
+
+        private final int maxAllocation;
+        private DecoderJNI.Wrapper decoder;
+        private long totalOutputBytes;
+        private boolean destroyed;
+
+        BoundedBrotliDecoder(int maxAllocation) {
+            this.maxAllocation = maxAllocation;
+        }
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+            decoder = new DecoderJNI.Wrapper(INPUT_BUFFER_SIZE);
+        }
+
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+            if (destroyed) {
+                // Skip data received after finished.
+                in.skipBytes(in.readableBytes());
+                return;
+            }
+
+            if (!in.isReadable()) {
+                return;
+            }
+
+            try {
+                if (decompress(in, out, ctx.alloc())) {
+                    destroy();
+                }
+            } catch (Exception e) {
+                destroy();
+                throw e;
+            }
+        }
+
+        /**
+         * Decompress the given input.
+         *
+         * @return {@code true} if the end of the brotli stream was reached
+         */
+        private boolean decompress(ByteBuf input, List<Object> output, ByteBufAllocator alloc) {
+            for (;;) {
+                DecoderJNI.Status status = decoder.getStatus();
+                if (status == DecoderJNI.Status.DONE) {
+                    return true;
+                }
+                if (status == DecoderJNI.Status.OK) {
+                    decoder.push(0);
+                } else if (status == DecoderJNI.Status.NEEDS_MORE_INPUT) {
+                    if (decoder.hasOutput()) {
+                        output.add(pull(alloc));
+                    }
+
+                    if (!input.isReadable()) {
+                        return false;
+                    }
+
+                    ByteBuffer decoderInputBuffer = decoder.getInputBuffer();
+                    decoderInputBuffer.clear();
+                    int readBytes = readBytes(input, decoderInputBuffer);
+                    decoder.push(readBytes);
+                } else if (status == DecoderJNI.Status.NEEDS_MORE_OUTPUT) {
+                    output.add(pull(alloc));
+                } else {
+                    throw new DecompressionException("Brotli stream corrupted");
+                }
+            }
+        }
+
+        private ByteBuf pull(ByteBufAllocator alloc) {
+            ByteBuffer nativeBuffer = decoder.pull();
+            int remaining = nativeBuffer.remaining();
+            totalOutputBytes += remaining;
+            if (totalOutputBytes > maxAllocation) {
+                // Fail before the output is copied, so no more than maxAllocation bytes are ever allocated.
+                throw new DecompressionException("Decompression buffer has reached maximum size: " + maxAllocation);
+            }
+            // nativeBuffer actually wraps brotli's internal buffer so we need to copy its content
+            ByteBuf copy = alloc.buffer(remaining);
+            copy.writeBytes(nativeBuffer);
+            return copy;
+        }
+
+        private static int readBytes(ByteBuf in, ByteBuffer dest) {
+            int limit = Math.min(in.readableBytes(), dest.remaining());
+            ByteBuffer slice = dest.slice();
+            slice.limit(limit);
+            in.readBytes(slice);
+            dest.position(dest.position() + limit);
+            return limit;
+        }
+
+        private void destroy() {
+            if (!destroyed) {
+                destroyed = true;
+                decoder.destroy();
+            }
+        }
+
+        @Override
+        protected void handlerRemoved0(ChannelHandlerContext ctx) throws Exception {
+            try {
+                destroy();
+            } finally {
+                super.handlerRemoved0(ctx);
+            }
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            try {
+                destroy();
+            } finally {
+                super.channelInactive(ctx);
+            }
+        }
     }
 
     /**
